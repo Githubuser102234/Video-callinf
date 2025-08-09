@@ -22,6 +22,29 @@
   }
   .mini-controls{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
   .status{margin-top:8px;color:var(--muted);font-size:0.9rem}
+  .chat-box {
+    display: none;
+    margin-top: 12px;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 8px;
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 0.9rem;
+    background: rgba(0,0,0,0.2);
+  }
+  .chat-input-area {
+    display: none;
+    margin-top: 4px;
+    display:flex;
+    gap:4px;
+  }
+  .chat-input-area input {
+    flex: 1;
+    padding: 6px;
+    border-radius: 6px;
+    border: 0;
+  }
 </style>
 </head>
 <body>
@@ -35,10 +58,12 @@
     <input id="roomInput" placeholder="Enter room name (e.g. room123)" />
     <button id="joinBtn">Join room</button>
     <button id="hangupBtn" class="ghost" disabled>Hang up</button>
-    <div id="chatBox" style="display:none;margin-top:12px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:8px;max-height:200px;overflow-y:auto;font-size:0.9rem;background:rgba(0,0,0,0.2)"></div>
-<div id="chatInputArea" style="display:none;margin-top:4px;display:flex;gap:4px;">
-  <input id="chatInput" placeholder="Type a message..." style="flex:1;padding:6px;border-radius:6px;border:0;" />
-  <button id="chatSendBtn">Send</button>
+  </div>
+
+  <div id="chatBox" class="chat-box"></div>
+  <div id="chatInputArea" class="chat-input-area">
+    <input id="chatInput" placeholder="Type a message..." />
+    <button id="chatSendBtn">Send</button>
   </div>
 
   <div class="mini-controls">
@@ -80,18 +105,29 @@ const toggleAudioBtn = document.getElementById('toggleAudio');
 const toggleVideoBtn = document.getElementById('toggleVideo');
 const copyLinkBtn = document.getElementById('copyLink');
 const statusEl = document.getElementById('status');
+const chatBox = document.getElementById('chatBox');
+const chatInputArea = document.getElementById('chatInputArea');
+const chatInput = document.getElementById('chatInput');
+const chatSendBtn = document.getElementById('chatSendBtn');
 
 let localStream = null;
 let pc = null;
 let room = null;
 let sub = null;
-const clientId = crypto.randomUUID(); // unique id to mark our messages
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]; // add TURN in prod if needed
+let chatSub = null;
+let nickname = 'Guest' + Math.floor(Math.random() * 1000);
+const clientId = crypto.randomUUID();
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 joinBtn.onclick = () => {
   const r = (roomInput.value || '').trim();
   if (!r) return alert('Enter a room name');
-  joinRoom(r);
+  // Prompt for a nickname before joining
+  const userNickname = prompt('Enter your nickname:', nickname);
+  if (userNickname) {
+    nickname = userNickname;
+    joinRoom(r);
+  }
 };
 hangupBtn.onclick = hangup;
 toggleAudioBtn.onclick = toggleAudio;
@@ -100,16 +136,30 @@ copyLinkBtn.onclick = () => {
   const r = roomInput.value.trim();
   if (!r) return alert('Enter a room name first');
   const link = location.href.split('#')[0] + '#room=' + encodeURIComponent(r);
-  navigator.clipboard?.writeText(link).then(()=> alert('Link copied!')).catch(()=> alert('Copy failed'));
+  navigator.clipboard?.writeText(link)
+    .then(() => alert('Link copied!'))
+    .catch(() => alert('Copy failed.'));
 };
 
-// If page has #room=... prefill
-(() => {
+// Check for room hash on page load
+(function init() {
   const m = location.hash.match(/room=([^&]+)/);
-  if (m) roomInput.value = decodeURIComponent(m[1]);
+  if (m) {
+    roomInput.value = decodeURIComponent(m[1]);
+    const userNickname = prompt('Enter your nickname:', nickname);
+    if (userNickname) {
+      nickname = userNickname;
+      joinRoom(roomInput.value);
+    }
+  }
 })();
 
 async function joinRoom(roomId) {
+  if (pc) {
+    console.log('Already in a call, hanging up first.');
+    await hangup();
+  }
+
   room = roomId;
   setStatus('Getting local media...');
   joinBtn.disabled = true;
@@ -126,48 +176,62 @@ async function joinRoom(roomId) {
 
   pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  // Add local tracks
+  // Add local tracks to the peer connection
   localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // When remote track arrives, set it to remoteVideo
+  // Handle remote video stream
   pc.addEventListener('track', (evt) => {
-    // attach the first stream
     if (remoteVideo.srcObject !== evt.streams[0]) {
       remoteVideo.srcObject = evt.streams[0];
     }
   });
 
-  // Send ICE candidates to supabase
+  // Handle ICE candidates
   pc.addEventListener('icecandidate', async (ev) => {
     if (!ev.candidate) return;
-    await postSignal({
-      room_id: room,
-      type: 'candidate',
-      data: ev.candidate.toJSON(),
-      sender: clientId
-    });
+    try {
+      await postSignal({
+        room_id: room,
+        type: 'candidate',
+        data: ev.candidate.toJSON(),
+        sender: clientId
+      });
+    } catch (e) {
+      console.error('Failed to post ICE candidate', e);
+    }
   });
+  
+  // Set up chat data channel (optional)
+  const dataChannel = pc.createDataChannel('chat');
+  dataChannel.onopen = () => console.log('Data channel open');
 
-  // subscribe to signals for this room
+  // Subscribe to signaling channel
   sub = supabase
     .channel('signals:' + room)
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'signals', filter: `room_id=eq.${room}` }, payload => {
       handleSignalRow(payload.new);
     })
     .subscribe(async (status) => {
-      // after subscription, check for existing offer/answer rows as fallback
       if (status === 'SUBSCRIBED') {
+        // After subscribing, check for an existing offer
         await checkExistingOffer();
       }
     });
 
+  // UI state updates
   toggleAudioBtn.disabled = false;
   toggleVideoBtn.disabled = false;
   hangupBtn.disabled = false;
-  setStatus('Joined room — waiting / negotiating...');
+
+  // Enable chat UI
+  chatBox.style.display = 'block';
+  chatInputArea.style.display = 'flex';
+  setupChat();
+
+  setStatus('Joined room, connecting...');
 }
 
-/* Check if an offer exists already in the table (someone else created the offer) */
+/* Check if an offer exists already in the table */
 async function checkExistingOffer() {
   try {
     const { data: offers, error } = await supabase
@@ -181,87 +245,122 @@ async function checkExistingOffer() {
     if (error) throw error;
 
     if (offers && offers.length > 0) {
-      // there's an offer; act as the answerer
+      // There's an offer; act as the answerer
       const offerRow = offers[0];
-      console.log('Found existing offer', offerRow);
       await handleOffer(offerRow);
     } else {
-      // no offer — act as the caller (create and post offer)
+      // No offer — act as the caller (create and post offer)
       await createAndPostOffer();
     }
   } catch (err) {
     console.error('checkExistingOffer error', err);
+    setStatus('Connection failed. Try refreshing.');
   }
 }
 
 async function createAndPostOffer() {
   setStatus('Creating offer...');
-  const dataChannel = pc.createDataChannel('chat'); // optional
-  dataChannel.onopen = () => console.log('data channel open');
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  await postSignal({
-    room_id: room,
-    type: 'offer',
-    data: offer,               // entire SDP object
-    sender: clientId
-  });
-
-  setStatus('Offer posted — waiting for answer...');
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await postSignal({
+      room_id: room,
+      type: 'offer',
+      data: offer,
+      sender: clientId
+    });
+    setStatus('Offer posted, waiting for answer...');
+  } catch (err) {
+    console.error('Failed to create and post offer', err);
+    setStatus('Failed to start call.');
+  }
 }
 
 /* Handle a new row inserted into signals table */
 async function handleSignalRow(row) {
-  // ignore our own messages
-  if (row.sender === clientId) return;
+  if (row.sender === clientId) return; // ignore our own messages
 
-  if (row.type === 'offer') {
-    // incoming offer
-    await handleOffer(row);
-  } else if (row.type === 'answer') {
-    // incoming answer
-    await handleAnswer(row);
-  } else if (row.type === 'candidate') {
-    // incoming ice candidate
-    try {
-      await pc.addIceCandidate(row.data);
-    } catch (err) {
-      console.warn('Failed to add candidate', err);
+  try {
+    if (row.type === 'offer') {
+      await handleOffer(row);
+    } else if (row.type === 'answer') {
+      await handleAnswer(row);
+    } else if (row.type === 'candidate') {
+      await pc.addIceCandidate(new RTCIceCandidate(row.data));
     }
+  } catch (err) {
+    console.warn('Failed to process signal', err);
   }
 }
 
 async function handleOffer(row) {
-  setStatus('Received offer — creating answer...');
-  const remoteDesc = row.data;
-  await pc.setRemoteDescription(remoteDesc);
-
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  await postSignal({
-    room_id: room,
-    type: 'answer',
-    data: answer,
-    sender: clientId
-  });
-
-  setStatus('Answer posted — establishing connection...');
+  setStatus('Received offer, creating answer...');
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(row.data));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await postSignal({
+      room_id: room,
+      type: 'answer',
+      data: answer,
+      sender: clientId
+    });
+    setStatus('Answer posted, establishing connection...');
+  } catch (err) {
+    console.error('Failed to handle offer', err);
+    setStatus('Connection failed. Try refreshing.');
+  }
 }
 
 async function handleAnswer(row) {
-  setStatus('Received answer — finalizing connection...');
-  const remoteDesc = row.data;
-  await pc.setRemoteDescription(remoteDesc);
-  setStatus('Connected (hopefully).');
+  setStatus('Received answer, finalizing connection...');
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(row.data));
+    setStatus('Connected.');
+  } catch (err) {
+    console.error('Failed to handle answer', err);
+    setStatus('Connection failed. Try refreshing.');
+  }
 }
 
 /* Post a signaling row to Supabase */
 async function postSignal(obj) {
   const { error } = await supabase.from('signals').insert(obj);
-  if (error) console.error('postSignal error', error);
+  if (error) {
+    console.error('postSignal error', error);
+    // Optionally, alert the user or try to recover
+  }
+}
+
+function setupChat() {
+  // Subscribe to messages
+  chatSub = supabase
+    .channel('chat:' + room)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_chat', filter: `room_id=eq.${room}` }, payload => {
+      const msg = payload.new;
+      const div = document.createElement('div');
+      div.textContent = `${msg.nickname}: ${msg.message}`;
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    })
+    .subscribe();
+
+  // Send message
+  chatSendBtn.onclick = async () => {
+    const text = chatInput.value.trim();
+    if (!text) return;
+    try {
+      const { error } = await supabase.from('call_chat').insert({
+        room_id: room,
+        nickname,
+        message: text
+      });
+      if (error) throw error;
+      chatInput.value = '';
+    } catch (e) {
+      console.error('Failed to send chat message', e);
+    }
+  };
 }
 
 /* Toggles */
@@ -283,11 +382,11 @@ function toggleVideo() {
 /* Hang up and cleanup */
 async function hangup() {
   setStatus('Hanging up and cleaning...');
-  // close RTCPeerConnection
-  try { pc?.close(); } catch(e) {}
-  pc = null;
-
-  // stop local tracks
+  try {
+    pc?.close();
+    pc = null;
+  } catch(e) { console.warn('pc.close() error', e); }
+  
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
@@ -295,22 +394,27 @@ async function hangup() {
     remoteVideo.srcObject = null;
   }
 
-  // unsubscribe
-  try {
-    if (sub) {
+  if (sub) {
+    try {
       await supabase.removeChannel(sub);
       sub = null;
-    }
-  } catch(e){ console.warn('removeChannel error', e); }
+    } catch(e) { console.warn('removeChannel error', e); }
+  }
+
+  if (chatSub) {
+    try {
+      await supabase.removeChannel(chatSub);
+      chatSub = null;
+    } catch(e) { console.warn('removeChannel error', e); }
+  }
 
   joinBtn.disabled = false;
   hangupBtn.disabled = true;
   toggleAudioBtn.disabled = true;
   toggleVideoBtn.disabled = true;
+  chatBox.style.display = 'none';
+  chatInputArea.style.display = 'none';
   setStatus('Idle');
-
-  // Optional: delete signals for this room that we created (tidy up). In production, set RLS + a cleanup policy instead.
-  // await supabase.from('signals').delete().eq('room_id', room).eq('sender', clientId);
   room = null;
 }
 
@@ -320,156 +424,11 @@ function setStatus(s) {
   console.log(s);
 }
 
-let nickname = null;
-let isOwner = false;
-
-
-(async () => {
-  const m = location.hash.match(/room=([^&]+)/);
-  if (m) {
-    roomInput.value = decodeURIComponent(m[1]);
-    nickname = prompt('Enter your nickname:');
-    if (!nickname) nickname = 'Guest' + Math.floor(Math.random()*1000);
-  }
-})();
-
-async function joinRoom(roomId) {
-  room = roomId;
-  
-  // Determine if we're the first person (owner) or joining
-  const { data: existingOffer } = await supabase
-    .from('signals')
-    .select('id')
-    .eq('room_id', room)
-    .limit(1);
-  isOwner = (existingOffer.length === 0);
-
-  if (!isOwner) {
-    // Joining → send join request
-    await supabase.from('join_requests').insert({
-      room_id: room,
-      nickname
-    });
-    setStatus('Join request sent, waiting for approval...');
-    // Wait for acceptance
-    const acceptSub = supabase
-      .channel('signals-accept:' + room)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'signals', filter: `room_id=eq.${room}` }, payload => {
-        if (payload.new.type === 'accepted') {
-          supabase.removeChannel(acceptSub);
-          setStatus('Approved! Connecting...');
-          actuallyJoin();
-        }
-      })
-      .subscribe();
-  } else {
-    // Owner → listen for join requests
-    supabase
-      .channel('joinreqs:' + room)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'join_requests', filter: `room_id=eq.${room}` }, async payload => {
-        const reqNick = payload.new.nickname;
-        if (confirm(`Join request from: ${reqNick} — Accept?`)) {
-          await supabase.from('signals').insert({
-            room_id: room,
-            type: 'accepted',
-            data: {},
-            sender: clientId
-          });
-        } else {
-          setStatus(`Rejected ${reqNick}`);
-        }
-      })
-      .subscribe();
-    actuallyJoin();
-  }
-}
-
-
-async function actuallyJoin() {
-  setStatus('Getting local media...');
-  joinBtn.disabled = true;
-
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  localVideo.srcObject = localStream;
-
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  pc.addEventListener('track', (evt) => {
-    if (remoteVideo.srcObject !== evt.streams[0]) {
-      remoteVideo.srcObject = evt.streams[0];
-    }
-  });
-
-  pc.addEventListener('icecandidate', async (ev) => {
-    if (!ev.candidate) return;
-    await postSignal({
-      room_id: room,
-      type: 'candidate',
-      data: ev.candidate.toJSON(),
-      sender: clientId
-    });
-  });
-
-  sub = supabase
-    .channel('signals:' + room)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'signals', filter: `room_id=eq.${room}` }, payload => {
-      handleSignalRow(payload.new);
-    })
-    .subscribe(async (status) => {
-      if (status === 'SUBSCRIBED') await checkExistingOffer();
-    });
-
-  toggleAudioBtn.disabled = false;
-  toggleVideoBtn.disabled = false;
-  hangupBtn.disabled = false;
-
-  // Enable chat UI
-  document.getElementById('chatBox').style.display = 'block';
-  document.getElementById('chatInputArea').style.display = 'flex';
-  setupChat();
-}
-
-
-
-function setupChat() {
-  const chatBox = document.getElementById('chatBox');
-  const chatInput = document.getElementById('chatInput');
-  const chatSendBtn = document.getElementById('chatSendBtn');
-
-  // Subscribe to messages
-  supabase
-    .channel('chat:' + room)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_chat', filter: `room_id=eq.${room}` }, payload => {
-      const msg = payload.new;
-      const div = document.createElement('div');
-      div.textContent = `${msg.nickname}: ${msg.message}`;
-      chatBox.appendChild(div);
-      chatBox.scrollTop = chatBox.scrollHeight;
-    })
-    .subscribe();
-
-  // Send message
-  chatSendBtn.onclick = async () => {
-    const text = chatInput.value.trim();
-    if (!text) return;
-    await supabase.from('call_chat').insert({
-      room_id: room,
-      nickname,
-      message: text
-    });
-    chatInput.value = '';
-  };
-}
-
-
-
-
-// Optionally keep the browser tab open on mobile screens by preventing sleep (experimental API)
+// Optional: keep the browser tab open on mobile screens
 if ('wakeLock' in navigator) {
   window.addEventListener('visibilitychange', async () => {
     if (document.visibilityState === 'visible') {
-      try { await navigator.wakeLock.request('screen'); } catch(e){}
+      try { await navigator.wakeLock.request('screen'); } catch(e){ console.error('Wake lock failed', e); }
     }
   });
 }
