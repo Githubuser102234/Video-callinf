@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>1:1 Video Call — Supabase Signaling</title>
+<style>
+  :root{--bg:#0f1720;--card:#0b1220;--accent:#22c1c3;--muted:#94a3b8;color-scheme:dark}
+  body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:linear-gradient(180deg,#071026 0%, #081426 100%);color:#e6eef6;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+  .app{width:100%;max-width:820px;background:rgba(255,255,255,0.03);border-radius:12px;padding:12px;box-shadow:0 6px 30px rgba(2,6,23,0.6)}
+  header{display:flex;gap:12px;align-items:center;margin-bottom:10px}
+  h1{font-size:1.05rem;margin:0}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+  input[type="text"]{flex:1;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
+  button{padding:10px 12px;border-radius:9px;border:0;background:var(--accent);color:#042027;font-weight:600}
+  button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted)}
+  .videos{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  video{width:100%;height:calc(100vw * 0.5);object-fit:cover;border-radius:8px;background:#001018}
+  @media (max-width:640px){
+    .videos{grid-template-columns:1fr;gap:8px}
+    video{height:58vw}
+  }
+  .mini-controls{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .status{margin-top:8px;color:var(--muted);font-size:0.9rem}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <h1>1:1 Video Call (Supabase signaling)</h1>
+  </header>
+
+  <div class="controls">
+    <input id="roomInput" placeholder="Enter room name (e.g. room123)" />
+    <button id="joinBtn">Join room</button>
+    <button id="hangupBtn" class="ghost" disabled>Hang up</button>
+  </div>
+
+  <div class="mini-controls">
+    <button id="toggleAudio" class="ghost" disabled>Mute</button>
+    <button id="toggleVideo" class="ghost" disabled>Camera Off</button>
+    <button id="copyLink" class="ghost">Copy Join Link</button>
+  </div>
+
+  <div class="videos" style="margin-top:10px">
+    <div>
+      <div style="font-size:0.85rem;color:var(--muted);margin-bottom:6px">Local</div>
+      <video id="localVideo" autoplay muted playsinline></video>
+    </div>
+    <div>
+      <div style="font-size:0.85rem;color:var(--muted);margin-bottom:6px">Remote</div>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <div class="status" id="status">Idle</div>
+</div>
+
+<script type="module">
+/* Minimal 1:1 WebRTC using Supabase for signaling.
+   Replace these with your Supabase project values */
+const SUPABASE_URL = 'https://hajfipnskdjsaltakeik.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhhamZpcG5za2Rqc2FsdGFrZWlrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ3NTM5NTAsImV4cCI6MjA3MDMyOTk1MH0.r1WY-TryIAMlkwbIdokCbc0lnCkQQVp1ZlsuT9Etph0';
+
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const localVideo = document.getElementById('localVideo');
+const remoteVideo = document.getElementById('remoteVideo');
+const roomInput = document.getElementById('roomInput');
+const joinBtn = document.getElementById('joinBtn');
+const hangupBtn = document.getElementById('hangupBtn');
+const toggleAudioBtn = document.getElementById('toggleAudio');
+const toggleVideoBtn = document.getElementById('toggleVideo');
+const copyLinkBtn = document.getElementById('copyLink');
+const statusEl = document.getElementById('status');
+
+let localStream = null;
+let pc = null;
+let room = null;
+let sub = null;
+const clientId = crypto.randomUUID(); // unique id to mark our messages
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]; // add TURN in prod if needed
+
+joinBtn.onclick = () => {
+  const r = (roomInput.value || '').trim();
+  if (!r) return alert('Enter a room name');
+  joinRoom(r);
+};
+hangupBtn.onclick = hangup;
+toggleAudioBtn.onclick = toggleAudio;
+toggleVideoBtn.onclick = toggleVideo;
+copyLinkBtn.onclick = () => {
+  const r = roomInput.value.trim();
+  if (!r) return alert('Enter a room name first');
+  const link = location.href.split('#')[0] + '#room=' + encodeURIComponent(r);
+  navigator.clipboard?.writeText(link).then(()=> alert('Link copied!')).catch(()=> alert('Copy failed'));
+};
+
+// If page has #room=... prefill
+(() => {
+  const m = location.hash.match(/room=([^&]+)/);
+  if (m) roomInput.value = decodeURIComponent(m[1]);
+})();
+
+async function joinRoom(roomId) {
+  room = roomId;
+  setStatus('Getting local media...');
+  joinBtn.disabled = true;
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localStream;
+  } catch (err) {
+    console.error('getUserMedia failed', err);
+    alert('Could not access camera/microphone: ' + err.message);
+    joinBtn.disabled = false;
+    return;
+  }
+
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+  // Add local tracks
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  // When remote track arrives, set it to remoteVideo
+  pc.addEventListener('track', (evt) => {
+    // attach the first stream
+    if (remoteVideo.srcObject !== evt.streams[0]) {
+      remoteVideo.srcObject = evt.streams[0];
+    }
+  });
+
+  // Send ICE candidates to supabase
+  pc.addEventListener('icecandidate', async (ev) => {
+    if (!ev.candidate) return;
+    await postSignal({
+      room_id: room,
+      type: 'candidate',
+      data: ev.candidate.toJSON(),
+      sender: clientId
+    });
+  });
+
+  // subscribe to signals for this room
+  sub = supabase
+    .channel('signals:' + room)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'signals', filter: `room_id=eq.${room}` }, payload => {
+      handleSignalRow(payload.new);
+    })
+    .subscribe(async (status) => {
+      // after subscription, check for existing offer/answer rows as fallback
+      if (status === 'SUBSCRIBED') {
+        await checkExistingOffer();
+      }
+    });
+
+  toggleAudioBtn.disabled = false;
+  toggleVideoBtn.disabled = false;
+  hangupBtn.disabled = false;
+  setStatus('Joined room — waiting / negotiating...');
+}
+
+/* Check if an offer exists already in the table (someone else created the offer) */
+async function checkExistingOffer() {
+  try {
+    const { data: offers, error } = await supabase
+      .from('signals')
+      .select('*')
+      .eq('room_id', room)
+      .eq('type', 'offer')
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (error) throw error;
+
+    if (offers && offers.length > 0) {
+      // there's an offer; act as the answerer
+      const offerRow = offers[0];
+      console.log('Found existing offer', offerRow);
+      await handleOffer(offerRow);
+    } else {
+      // no offer — act as the caller (create and post offer)
+      await createAndPostOffer();
+    }
+  } catch (err) {
+    console.error('checkExistingOffer error', err);
+  }
+}
+
+async function createAndPostOffer() {
+  setStatus('Creating offer...');
+  const dataChannel = pc.createDataChannel('chat'); // optional
+  dataChannel.onopen = () => console.log('data channel open');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  await postSignal({
+    room_id: room,
+    type: 'offer',
+    data: offer,               // entire SDP object
+    sender: clientId
+  });
+
+  setStatus('Offer posted — waiting for answer...');
+}
+
+/* Handle a new row inserted into signals table */
+async function handleSignalRow(row) {
+  // ignore our own messages
+  if (row.sender === clientId) return;
+
+  if (row.type === 'offer') {
+    // incoming offer
+    await handleOffer(row);
+  } else if (row.type === 'answer') {
+    // incoming answer
+    await handleAnswer(row);
+  } else if (row.type === 'candidate') {
+    // incoming ice candidate
+    try {
+      await pc.addIceCandidate(row.data);
+    } catch (err) {
+      console.warn('Failed to add candidate', err);
+    }
+  }
+}
+
+async function handleOffer(row) {
+  setStatus('Received offer — creating answer...');
+  const remoteDesc = row.data;
+  await pc.setRemoteDescription(remoteDesc);
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  await postSignal({
+    room_id: room,
+    type: 'answer',
+    data: answer,
+    sender: clientId
+  });
+
+  setStatus('Answer posted — establishing connection...');
+}
+
+async function handleAnswer(row) {
+  setStatus('Received answer — finalizing connection...');
+  const remoteDesc = row.data;
+  await pc.setRemoteDescription(remoteDesc);
+  setStatus('Connected (hopefully).');
+}
+
+/* Post a signaling row to Supabase */
+async function postSignal(obj) {
+  const { error } = await supabase.from('signals').insert(obj);
+  if (error) console.error('postSignal error', error);
+}
+
+/* Toggles */
+function toggleAudio() {
+  if (!localStream) return;
+  const track = localStream.getAudioTracks()[0];
+  if (!track) return;
+  track.enabled = !track.enabled;
+  toggleAudioBtn.textContent = track.enabled ? 'Mute' : 'Unmute';
+}
+function toggleVideo() {
+  if (!localStream) return;
+  const track = localStream.getVideoTracks()[0];
+  if (!track) return;
+  track.enabled = !track.enabled;
+  toggleVideoBtn.textContent = track.enabled ? 'Camera Off' : 'Camera On';
+}
+
+/* Hang up and cleanup */
+async function hangup() {
+  setStatus('Hanging up and cleaning...');
+  // close RTCPeerConnection
+  try { pc?.close(); } catch(e) {}
+  pc = null;
+
+  // stop local tracks
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+    localVideo.srcObject = null;
+    remoteVideo.srcObject = null;
+  }
+
+  // unsubscribe
+  try {
+    if (sub) {
+      await supabase.removeChannel(sub);
+      sub = null;
+    }
+  } catch(e){ console.warn('removeChannel error', e); }
+
+  joinBtn.disabled = false;
+  hangupBtn.disabled = true;
+  toggleAudioBtn.disabled = true;
+  toggleVideoBtn.disabled = true;
+  setStatus('Idle');
+
+  // Optional: delete signals for this room that we created (tidy up). In production, set RLS + a cleanup policy instead.
+  // await supabase.from('signals').delete().eq('room_id', room).eq('sender', clientId);
+  room = null;
+}
+
+/* tiny utility */
+function setStatus(s) {
+  statusEl.textContent = s;
+  console.log(s);
+}
+
+// Optionally keep the browser tab open on mobile screens by preventing sleep (experimental API)
+if ('wakeLock' in navigator) {
+  window.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible') {
+      try { await navigator.wakeLock.request('screen'); } catch(e){}
+    }
+  });
+}
+</script>
+</body>
+</html>
